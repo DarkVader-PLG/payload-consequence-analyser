@@ -454,3 +454,4 @@ Every signal was there. The age. The deletion ratio. The structural wipeout. The
 ---
 
 *PayloadGuard — because AI doesn't feel bad about what it breaks.*
+
