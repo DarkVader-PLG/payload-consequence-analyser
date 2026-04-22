@@ -368,25 +368,36 @@ class PayloadAnalyzer:
         self.repo_path = repo_path
         self.config = config or PayloadGuardConfig()
 
-    def _calculate_target_velocity(self) -> float:
+    def _calculate_target_velocity(self, target_ref: str = None) -> float:
         """
         Calculates commits per day on the target branch over the last 90 days.
         Returns 0.0 safely if the calculation fails for any reason.
         """
+        ref = target_ref or self.target
         try:
-            target_commit = self.repo.commit(self.target)
+            target_commit = self.repo.commit(ref)
             since = target_commit.committed_datetime - timedelta(days=90)
             commits = list(
-                self.repo.iter_commits(self.target, since=since.isoformat())
+                self.repo.iter_commits(ref, since=since.isoformat())
             )
             return round(len(commits) / 90.0, 3)
         except Exception:
             return 0.0
 
+    def _resolve_ref(self, ref: str) -> str:
+        """Resolve a ref, falling back to origin/<ref> for CI detached-HEAD checkouts."""
+        try:
+            self.repo.commit(ref)
+            return ref
+        except git.exc.BadName:
+            origin_ref = f"origin/{ref}"
+            self.repo.commit(origin_ref)  # raises BadName if also absent
+            return origin_ref
+
     def analyze(self, pr_description: str = ""):
         try:
             try:
-                self.repo.commit(self.target)
+                target_ref = self._resolve_ref(self.target)
             except git.exc.BadName:
                 return {
                     "error": f"Target branch '{self.target}' not found",
@@ -394,15 +405,15 @@ class PayloadAnalyzer:
                 }
 
             try:
-                self.repo.commit(self.branch)
+                branch_ref = self._resolve_ref(self.branch)
             except git.exc.BadName:
                 return {
                     "error": f"Branch '{self.branch}' not found",
                     "available_branches": [ref.name for ref in self.repo.heads],
                 }
 
-            merge_base = self.repo.merge_base(self.target, self.branch)
-            diffs = merge_base[0].diff(self.branch)
+            merge_base = self.repo.merge_base(target_ref, branch_ref)
+            diffs = merge_base[0].diff(branch_ref)
 
             # LAYER 1: FILE COUNTS
             files_added    = len([d for d in diffs if d.change_type == 'A'])
@@ -464,8 +475,8 @@ class PayloadAnalyzer:
                 except Exception:
                     pass
 
-            branch_commit = self.repo.commit(self.branch)
-            target_commit = self.repo.commit(self.target)
+            branch_commit = self.repo.commit(branch_ref)
+            target_commit = self.repo.commit(target_ref)
             branch_date = branch_commit.committed_datetime
             target_date = target_commit.committed_datetime
             days_old = (target_date - branch_date).days
@@ -491,7 +502,7 @@ class PayloadAnalyzer:
 
             # LAYER 5a: TEMPORAL DRIFT
             temporal_th = self.config.thresholds["temporal"]
-            target_velocity = self._calculate_target_velocity()
+            target_velocity = self._calculate_target_velocity(target_ref)
             temporal_drift = TemporalDriftAnalyzer(
                 branch_age_days=max(days_old, 0),
                 target_velocity_commits_per_day=target_velocity,
