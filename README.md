@@ -89,9 +89,11 @@ Volume and direction of change. Deletion ratio is the derived signal — what fr
 
 ### 🧬 Structural drift — Layer 4
 
-Parses every modified Python file into an AST and computes exactly which named classes and functions disappeared. This is the layer that catches a file being "modified" when it's actually been gutted — line diffs alone won't tell you that `AuthManager` and `SessionStore` no longer exist.
+Parses every modified source file and computes exactly which named classes and functions disappeared. This is the layer that catches a file being "modified" when it's actually been gutted — line diffs alone won't tell you that `AuthManager` and `SessionStore` no longer exist.
 
 Flags `CRITICAL` only when both conditions are met: deletion ratio exceeds the threshold **and** enough nodes were deleted. The dual gate prevents noise from small utility files.
+
+**Supported languages:** Python · JavaScript · TypeScript · Go · Rust · Java (`.py .js .jsx .ts .tsx .go .rs .java`). Python uses stdlib AST. All others use [tree-sitter](https://tree-sitter.github.io/) grammar packages — files for grammars not installed are skipped silently.
 
 ```
 🧬 STRUCTURAL DRIFT (Layer 4)
@@ -347,7 +349,7 @@ Five layers. Every scan, every time.
 | 1 — Surface Scan | Files and lines changed |
 | 2 — Forensic Analysis | Deletion ratio, critical path detection |
 | 3 — Consequence Model | Weighted score → final verdict |
-| 4 — Structural Drift | AST diff — which classes and functions actually disappeared |
+| 4 — Structural Drift | AST/tree-sitter diff — which classes and functions actually disappeared (Python, JS, TS, Go, Rust, Java) |
 | 5a — Temporal Drift | Branch age × repo velocity |
 | 5b — Semantic Transparency | Does the PR description match what the diff actually does |
 

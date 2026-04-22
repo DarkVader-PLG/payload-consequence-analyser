@@ -12,7 +12,6 @@ Example:
 """
 
 import argparse
-import ast
 import copy
 import git
 import re
@@ -24,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Union
 from dataclasses import dataclass, field
+import structural_parser
 
 
 # ==============================================================================
@@ -81,26 +81,18 @@ class StructuralPayloadAnalyzer:
         self,
         original_code: str,
         modified_code: str,
+        file_path: str = "",
         deletion_ratio_threshold: float = 0.20,
         min_deletion_count: int = 3,
     ):
         self.original_code = original_code
         self.modified_code = modified_code
+        self.file_path = file_path
         self.deletion_ratio_threshold = deletion_ratio_threshold
         self.min_deletion_count = min_deletion_count
 
     def _extract_core_nodes(self, source_text: str) -> set:
-        try:
-            tree = ast.parse(source_text)
-        except SyntaxError as e:
-            raise ValueError(f"SyntaxError during AST parsing: {e}")
-
-        core_nodes = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                core_nodes.add(node.name)
-
-        return core_nodes
+        return structural_parser.extract_named_nodes(source_text, self.file_path)
 
     def analyze_structural_drift(self) -> Dict[str, Any]:
         """
@@ -440,7 +432,7 @@ class PayloadAnalyzer:
                     except Exception:
                         pass
 
-            # LAYER 4: STRUCTURAL DRIFT (Python files only)
+            # LAYER 4: STRUCTURAL DRIFT
             structural_th = self.config.thresholds["structural"]
             structural_score = 0.0
             structural_flags = []
@@ -450,13 +442,14 @@ class PayloadAnalyzer:
                 if d.change_type != 'M':
                     continue
                 path = d.b_path or d.a_path or ''
-                if not path.endswith('.py'):
+                if structural_parser.language_for_path(path) is None:
                     continue
                 try:
                     original = d.a_blob.data_stream.read().decode('utf-8', errors='ignore')
                     modified = d.b_blob.data_stream.read().decode('utf-8', errors='ignore')
                     result = StructuralPayloadAnalyzer(
                         original, modified,
+                        file_path=path,
                         deletion_ratio_threshold=structural_th["deletion_ratio"],
                         min_deletion_count=structural_th["min_deleted_nodes"],
                     ).analyze_structural_drift()
@@ -608,7 +601,7 @@ class PayloadAnalyzer:
             severity_score += 1
 
         if structural_severity == "CRITICAL":
-            flags.append("Structural drift CRITICAL — significant Python class/function deletions detected")
+            flags.append("Structural drift CRITICAL — significant class/function deletions detected")
             severity_score += 3
 
         if lines_deleted > lines_th[2]:
