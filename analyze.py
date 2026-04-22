@@ -741,6 +741,152 @@ def print_report(report):
     print("\n" + "="*70 + "\n")
 
 
+def format_markdown_report(report: dict) -> str:
+    """Generate GitHub-flavoured markdown from a PayloadGuard report."""
+    if "error" in report:
+        return (
+            "## ❌ PayloadGuard — Analysis Failed\n\n"
+            f"`{report['error']}`\n"
+        )
+
+    analysis = report['analysis']
+    files    = report['files']
+    lines    = report['lines']
+    temporal = report['temporal']
+    verdict  = report['verdict']
+    deleted  = report['deleted_files']
+
+    verdict_emoji = {
+        "SAFE":        "✅",
+        "REVIEW":      "🔵",
+        "CAUTION":     "⚠️",
+        "DESTRUCTIVE": "🚨",
+    }.get(verdict['status'], "❓")
+
+    out = []
+    out.append(f"## {verdict_emoji} PayloadGuard — `{verdict['status']}` [{verdict['severity']}]")
+    out.append(f"\n> `{analysis['branch']}` → `{analysis['target']}`")
+    out.append(f"\n**{verdict['recommendation']}**")
+    out.append("")
+
+    if verdict['flags']:
+        for flag in verdict['flags']:
+            out.append(f"- ⚠️ {flag}")
+        out.append("")
+
+    out.append("---")
+    out.append("")
+
+    # Temporal
+    out.append("### 📅 Temporal")
+    out.append("| | |")
+    out.append("|---|---|")
+    out.append(f"| Branch age | {temporal['branch_age_days']} days |")
+    out.append(f"| Branch commit | `{temporal['branch_commit_hash']}` ({temporal['branch_last_commit'][:10]}) |")
+    out.append(f"| Target commit | `{temporal['target_commit_hash']}` ({temporal['target_last_commit'][:10]}) |")
+    out.append("")
+
+    # File changes
+    out.append("### 📁 File Changes")
+    out.append("| Type | Count |")
+    out.append("|---|---|")
+    out.append(f"| Added | {files['added']} |")
+    out.append(f"| Deleted | {files['deleted']} |")
+    out.append(f"| Modified | {files['modified']} |")
+    out.append(f"| Total | {files['total_changed']} |")
+    out.append("")
+
+    # Line changes
+    out.append("### 📝 Line Changes")
+    out.append("| | |")
+    out.append("|---|---|")
+    out.append(f"| Added | {lines['added']:,} |")
+    out.append(f"| Deleted | {lines['deleted']:,} |")
+    out.append(f"| Net | {lines['net_change']:,} |")
+    out.append(f"| Deletion ratio | {lines['deletion_ratio_percent']}% |")
+    out.append("")
+
+    # Structural drift
+    if 'structural' in report:
+        s = report['structural']
+        sev_emoji = "🚨" if s['overall_severity'] == 'CRITICAL' else "✅"
+        out.append("### 🧬 Structural Drift (Layer 4)")
+        out.append(
+            f"**Severity:** {sev_emoji} `{s['overall_severity']}`"
+            f"  |  **Max deletion ratio:** {s['max_deletion_ratio_pct']}%"
+        )
+        out.append("")
+        if s['flagged_files']:
+            out.append("| File | Nodes deleted | Ratio | Severity |")
+            out.append("|---|---|---|---|")
+            for ff in s['flagged_files']:
+                m = ff['metrics']
+                out.append(
+                    f"| `{ff['file']}` | {m['deleted_node_count']} |"
+                    f" {m['structural_deletion_ratio']}% | {ff['severity']} |"
+                )
+            for ff in s['flagged_files']:
+                if ff['severity'] == 'CRITICAL' and ff['deleted_components']:
+                    out.append(f"\n**Deleted from `{ff['file']}`:**")
+                    for comp in ff['deleted_components'][:10]:
+                        out.append(f"- `{comp}`")
+        out.append("")
+
+    # Temporal drift
+    if 'temporal_drift' in report:
+        td = report['temporal_drift']
+        m  = td['metrics']
+        td_emoji = {"CRITICAL": "🚨", "WARNING": "⚠️"}.get(td['severity'], "✅")
+        out.append("### ⏱ Temporal Drift (Layer 5a)")
+        out.append(f"**Status:** {td_emoji} `{td['status']}`")
+        out.append("")
+        out.append("| | |")
+        out.append("|---|---|")
+        out.append(f"| Drift Score | {m['calculated_drift_score']:.1f} |")
+        out.append(f"| Target velocity | {m['target_velocity']} commits/day |")
+        out.append("")
+        out.append(f"> {td['recommendation']}")
+        out.append("")
+
+    # Semantic transparency
+    if 'semantic' in report:
+        sem = report['semantic']
+        sem_emoji = {"DECEPTIVE_PAYLOAD": "🚨", "UNVERIFIED": "⚠️"}.get(sem['status'], "✅")
+        out.append("### 🔎 Semantic Transparency (Layer 5b)")
+        out.append(f"**Status:** {sem_emoji} `{sem['status']}`")
+        if sem.get('matched_keyword'):
+            out.append(f"  \n**Matched keyword:** `{sem['matched_keyword']}`")
+        out.append(f"\n> {sem['directive']}")
+        out.append("")
+
+    # Deleted files
+    if deleted['total'] > 0:
+        out.append(f"### 🗑️ Deleted Files ({deleted['total']} total)")
+        out.append("")
+        if deleted['critical']:
+            out.append("**Critical deletions:**")
+            for f in deleted['critical']:
+                out.append(f"- `{f}`")
+            out.append("")
+        other = [f for f in deleted['all'] if f not in deleted['critical']]
+        if other:
+            out.append("<details><summary>Other deletions</summary>")
+            out.append("")
+            for f in other[:20]:
+                out.append(f"- `{f}`")
+            if deleted['total'] > 30:
+                out.append(f"\n_...and {deleted['total'] - 30} more_")
+            out.append("")
+            out.append("</details>")
+            out.append("")
+
+    out.append("---")
+    ts = report.get('timestamp', '')[:16].replace('T', ' ')
+    out.append(f"_PayloadGuard scan — {ts} UTC_")
+
+    return "\n".join(out)
+
+
 def save_json_report(report, filename="consequence_report.json"):
     try:
         with open(filename, 'w') as f:
@@ -748,6 +894,15 @@ def save_json_report(report, filename="consequence_report.json"):
         print(f"✓ Report saved to {filename}")
     except Exception as e:
         print(f"⚠️  Could not save JSON report: {e}")
+
+
+def save_markdown_report(report, filename="payloadguard-report.md"):
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(format_markdown_report(report))
+        print(f"✓ Markdown report saved to {filename}")
+    except Exception as e:
+        print(f"⚠️  Could not save markdown report: {e}", file=sys.stderr)
 
 
 def main():
@@ -777,6 +932,9 @@ def main():
     parser.add_argument("--save-json", nargs="?", const="consequence_report.json",
                         metavar="FILE",
                         help="Save JSON report (default filename: consequence_report.json)")
+    parser.add_argument("--save-markdown", nargs="?", const="payloadguard-report.md",
+                        metavar="FILE",
+                        help="Save GitHub-flavoured markdown report (default: payloadguard-report.md)")
 
     args = parser.parse_args()
 
@@ -787,6 +945,9 @@ def main():
 
     if args.save_json:
         save_json_report(report, args.save_json)
+
+    if args.save_markdown:
+        save_markdown_report(report, args.save_markdown)
 
     if "error" in report:
         sys.exit(1)
