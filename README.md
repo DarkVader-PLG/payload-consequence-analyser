@@ -23,6 +23,12 @@ Scans a branch before merge and tells you exactly how badly it's going to hurt.
 ## Install
 
 ```bash
+pip install payloadguard-plg
+```
+
+Or from source:
+
+```bash
 pip install -r requirements.txt
 ```
 

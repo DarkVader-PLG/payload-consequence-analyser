@@ -3,8 +3,8 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "payloadguard"
-version = "1.0.0"
+name = "payloadguard-plg"
+version = "1.0.2"
 description = "Scans a branch before merge and tells you exactly how badly it's going to hurt."
 readme = "README.md"
 license = "MIT"
