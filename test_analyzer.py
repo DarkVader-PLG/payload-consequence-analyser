@@ -493,6 +493,14 @@ class TestAnalyzeErrors(unittest.TestCase):
         result = self.a.analyze()
         self.assertIn("available_branches", result)
 
+    def test_empty_merge_base_returns_error(self):
+        self.a.repo.commit.side_effect = None
+        self.a.repo.commit.return_value = MagicMock()
+        self.a.repo.merge_base.return_value = []
+        result = self.a.analyze()
+        self.assertIn("error", result)
+        self.assertIn("common ancestor", result["error"])
+
 
 # ==============================================================================
 # PayloadAnalyzer — successful analysis
@@ -626,6 +634,22 @@ class TestAnalyzeSuccess(unittest.TestCase):
         result = a.analyze(pr_description="minor syntax fix")
         self.assertIn("semantic", result)
         self.assertIn("status", result["semantic"])
+
+    def test_commit_flags_key_present(self):
+        a = self._setup_repo([self._build_mock_diff("M")])
+        result = a.analyze()
+        self.assertIn("commit_flags", result)
+        self.assertIsInstance(result["commit_flags"], list)
+
+    def test_red_flag_commit_message_detected(self):
+        a = self._setup_repo([self._build_mock_diff("M")])
+        suspicious = MagicMock()
+        suspicious.hexsha = "abcdef1234567"
+        suspicious.message = "remove all tests to simplify CI"
+        a.repo.iter_commits.side_effect = lambda *args, **kwargs: [suspicious]
+        result = a.analyze()
+        self.assertEqual(len(result["commit_flags"]), 1)
+        self.assertEqual(result["commit_flags"][0]["sha"], "abcdef1")
 
 
 # ==============================================================================
