@@ -370,8 +370,9 @@ class TestAssessConsequenceDestructive(unittest.TestCase):
         self.assertEqual(v["severity"], "CRITICAL")
 
     def test_high_deletion_ratio_and_line_count(self):
+        # ratio+lines both fire → deletion_dim capped at 4, no age → CAUTION not DESTRUCTIVE
         v = self.a._assess_consequence(0, 15000, 10, 95)
-        self.assertEqual(v["status"], "DESTRUCTIVE")
+        self.assertEqual(v["status"], "CAUTION")
 
     def test_combined_flags_score(self):
         v = self.a._assess_consequence(60, 60000, 400, 95)
@@ -529,7 +530,28 @@ class TestAnalyzeSuccess(unittest.TestCase):
 
         merge_base_commit = MagicMock()
         merge_base_commit.diff.return_value = diffs
+        merge_base_commit.hexsha = "deadbeef00000000"
         a.repo.merge_base.return_value = [merge_base_commit]
+
+        # Build numstat output from mock diff blobs so line-count tests work.
+        numstat_lines = []
+        for d in diffs:
+            added, deleted = 0, 0
+            path = getattr(d, 'b_path', None) or getattr(d, 'a_path', None) or 'file.py'
+            if d.change_type == 'A':
+                try:
+                    content = d.b_blob.data_stream.read().decode('utf-8', errors='ignore')
+                    added = len(content.splitlines())
+                except Exception:
+                    pass
+            elif d.change_type == 'D':
+                try:
+                    content = d.a_blob.data_stream.read().decode('utf-8', errors='ignore')
+                    deleted = len(content.splitlines())
+                except Exception:
+                    pass
+            numstat_lines.append(f"{added}\t{deleted}\t{path}")
+        a.repo.git.diff.return_value = "\n".join(numstat_lines)
 
         return a
 
@@ -773,6 +795,207 @@ class TestSaveJsonReport(unittest.TestCase):
     def test_gracefully_handles_write_error(self):
         with patch("builtins.open", side_effect=PermissionError("denied")):
             save_json_report({"x": 1}, "/bad/path.json")
+
+
+# ==============================================================================
+# Binary file deletion
+# ==============================================================================
+
+class TestBinaryFileDeletion(unittest.TestCase):
+    def test_binary_files_do_not_inflate_line_counts(self):
+        """numstat returns '-' for binary files; those must not be counted."""
+        inner = TestAnalyzeSuccess()
+        a = inner._setup_repo([])
+        # One binary deletion (-/-) plus one normal deletion (0/8)
+        a.repo.git.diff.return_value = "-\t-\tlibrary.so\n0\t8\tnormal.py"
+        result = a.analyze()
+        self.assertNotIn("error", result)
+        self.assertEqual(result["lines"]["added"], 0)
+        self.assertEqual(result["lines"]["deleted"], 8)
+
+
+# ==============================================================================
+# Negative branch age (branch newer than target)
+# ==============================================================================
+
+class TestNegativeBranchAge(unittest.TestCase):
+    def test_branch_newer_than_target_does_not_crash(self):
+        a = _make_analyzer()
+        t_branch = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        t_target = datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+        branch_commit = MagicMock()
+        branch_commit.committed_datetime = t_branch
+        branch_commit.hexsha = "aabbccdd"
+
+        target_commit = MagicMock()
+        target_commit.committed_datetime = t_target
+        target_commit.hexsha = "11223344"
+
+        a.repo.commit.side_effect = lambda ref: target_commit if ref == "main" else branch_commit
+        a.repo.iter_commits.return_value = []
+
+        merge_base_commit = MagicMock()
+        merge_base_commit.diff.return_value = []
+        merge_base_commit.hexsha = "deadbeef"
+        a.repo.merge_base.return_value = [merge_base_commit]
+        a.repo.git.diff.return_value = ""
+
+        result = a.analyze()
+        self.assertNotIn("error", result)
+        self.assertEqual(result["temporal"]["branch_age_days"], 0)
+
+    def test_zero_age_does_not_trigger_age_flag(self):
+        a = _make_analyzer()
+        v = a._assess_consequence(0, 0, 0, 0)
+        self.assertFalse(any("days old" in f for f in v["flags"]))
+
+
+# ==============================================================================
+# Malformed payloadguard.yml
+# ==============================================================================
+
+class TestMalformedConfig(unittest.TestCase):
+    def test_malformed_yaml_falls_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "payloadguard.yml"), "w") as f:
+                f.write("thresholds:\n  branch_age_days: [not: {valid\n")
+            cfg = load_config(tmpdir)
+        self.assertEqual(cfg.thresholds["branch_age_days"], [90, 180, 365])
+
+    def test_empty_yaml_falls_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "payloadguard.yml"), "w") as f:
+                f.write("")
+            cfg = load_config(tmpdir)
+        self.assertEqual(cfg.thresholds["branch_age_days"], [90, 180, 365])
+
+
+# ==============================================================================
+# Threshold order validation (§2.6)
+# ==============================================================================
+
+class TestThresholdOrderValidation(unittest.TestCase):
+    def test_out_of_order_age_thresholds_are_sorted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "payloadguard.yml"), "w") as f:
+                f.write("thresholds:\n  branch_age_days: [365, 90, 180]\n")
+            cfg = load_config(tmpdir)
+        self.assertEqual(cfg.thresholds["branch_age_days"], [90, 180, 365])
+
+    def test_out_of_order_files_thresholds_are_sorted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "payloadguard.yml"), "w") as f:
+                f.write("thresholds:\n  files_deleted: [50, 10, 20]\n")
+            cfg = load_config(tmpdir)
+        self.assertEqual(cfg.thresholds["files_deleted"], [10, 20, 50])
+
+    def test_already_ordered_thresholds_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "payloadguard.yml"), "w") as f:
+                f.write("thresholds:\n  lines_deleted: [1000, 5000, 20000]\n")
+            cfg = load_config(tmpdir)
+        self.assertEqual(cfg.thresholds["lines_deleted"], [1000, 5000, 20000])
+
+
+# ==============================================================================
+# Critical path scoring (§3.2)
+# ==============================================================================
+
+class TestCriticalPathScoring(unittest.TestCase):
+    def setUp(self):
+        self.a = _make_analyzer()
+
+    def test_zero_critical_deletions_no_bonus(self):
+        v = self.a._assess_consequence(0, 0, 0, 0, critical_file_deletions=0)
+        self.assertEqual(v["status"], "SAFE")
+
+    def test_small_critical_deletions_adds_one_point(self):
+        v = self.a._assess_consequence(0, 0, 0, 0, critical_file_deletions=1)
+        self.assertEqual(v["severity_score"], 1)
+        self.assertEqual(v["status"], "REVIEW")
+
+    def test_many_critical_deletions_adds_two_points(self):
+        v = self.a._assess_consequence(0, 0, 0, 0, critical_file_deletions=6)
+        self.assertEqual(v["severity_score"], 2)
+        self.assertEqual(v["status"], "REVIEW")
+
+    def test_critical_deletions_combined_reach_caution(self):
+        # age(1) + critical(2) = 3 → CAUTION
+        v = self.a._assess_consequence(0, 0, 91, 0, critical_file_deletions=6)
+        self.assertEqual(v["status"], "CAUTION")
+
+    def test_critical_path_flag_text_present(self):
+        v = self.a._assess_consequence(0, 0, 0, 0, critical_file_deletions=3)
+        self.assertTrue(any("critical" in f.lower() for f in v["flags"]))
+
+
+# ==============================================================================
+# Markdown escaping (§5.3)
+# ==============================================================================
+
+class TestMarkdownEscaping(unittest.TestCase):
+    def test_backtick_in_deleted_filename_escaped(self):
+        from analyze import format_markdown_report, _md_escape
+        report = _make_full_report(files_deleted=1)
+        report["deleted_files"]["critical"] = ["src/`evil`.py"]
+        report["deleted_files"]["all"] = ["src/`evil`.py"]
+        md = format_markdown_report(report)
+        self.assertNotIn("src/`evil`.py", md)
+        self.assertIn(_md_escape("src/`evil`.py"), md)
+
+    def test_pipe_in_structural_filename_escaped(self):
+        from analyze import format_markdown_report
+        report = _make_full_report()
+        report["structural"]["flagged_files"] = [{
+            "file": "src/mo|dule.py",
+            "severity": "CRITICAL",
+            "metrics": {"deleted_node_count": 5, "structural_deletion_ratio": 80.0},
+            "deleted_components": ["AuthManager"],
+        }]
+        md = format_markdown_report(report)
+        self.assertNotIn("src/mo|dule.py", md)
+        self.assertIn("mo\\|dule", md)
+
+
+# ==============================================================================
+# post_check_run.py coverage
+# ==============================================================================
+
+class TestPostCheckRun(unittest.TestCase):
+    def _import_pcr(self):
+        """Import post_check_run, skipping if the crypto stack is unavailable."""
+        try:
+            import post_check_run as pcr
+            return pcr
+        except BaseException:
+            self.skipTest("post_check_run dependencies unavailable in this environment")
+
+    def test_require_env_raises_on_missing_var(self):
+        pcr = self._import_pcr()
+        env = {k: v for k, v in os.environ.items() if k != "NONEXISTENT_VAR_XYZ123"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(EnvironmentError):
+                pcr._require_env("NONEXISTENT_VAR_XYZ123")
+
+    def test_require_env_returns_stripped_value(self):
+        pcr = self._import_pcr()
+        with patch.dict(os.environ, {"MY_TEST_VAR_PCR": "  hello  "}):
+            self.assertEqual(pcr._require_env("MY_TEST_VAR_PCR"), "hello")
+
+    def test_main_skips_without_app_id(self):
+        """When PAYLOADGUARD_APP_ID is absent main() prints and returns before touching jwt."""
+        pcr = self._import_pcr()
+        original_get = os.environ.get
+        def fake_get(key, default=""):
+            if key == "PAYLOADGUARD_APP_ID":
+                return ""
+            return original_get(key, default)
+        with patch("os.environ.get", side_effect=fake_get):
+            with patch("builtins.print") as mock_print:
+                pcr.main()
+                printed = " ".join(str(c) for c in mock_print.call_args_list)
+                self.assertIn("skipping", printed.lower())
 
 
 if __name__ == "__main__":

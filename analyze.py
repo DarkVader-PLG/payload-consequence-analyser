@@ -34,15 +34,41 @@ import structural_parser
 # ==============================================================================
 
 CRITICAL_PATH_PATTERNS = [
-    r"(^|/)tests?(/|$)",               # test/ or tests/ directories
-    r"(^|/)test_[^/]+$",               # test_*.py files at any depth
-    r"(^|/)\.github/",                 # any .github/ content
-    r"(^|/)requirements[^/]*\.txt$",   # requirements.txt, requirements-dev.txt
+    # Test infrastructure
+    r"(^|/)tests?(/|$)",
+    r"(^|/)test_[^/]+$",
+    # CI/CD and workflows
+    r"(^|/)\.github/",
+    r"(^|/)Dockerfile[^/]*$",
+    r"(^|/)docker-compose[^/]*\.(yml|yaml)$",
+    r"(^|/)Makefile$",
+    # Dependency manifests
+    r"(^|/)requirements[^/]*\.txt$",
     r"(^|/)setup\.py$",
+    r"(^|/)pyproject\.toml$",
+    r"(^|/)package\.json$",
+    r"(^|/)Cargo\.toml$",
+    r"(^|/)go\.mod$",
+    r"(^|/)pom\.xml$",
+    r"(^|/)build\.gradle(\.kts)?$",
+    # Package init
     r"(^|/)__init__\.py$",
+    # Architecture directories
     r"(^|/)core(/|$)",
     r"(^|/)modules(/|$)",
     r"(^|/)config(/|$)",
+    # Security-sensitive files
+    r"(^|/)auth[^/]*\.(py|js|ts)$",
+    r"(^|/)security[^/]*\.(py|js|ts)$",
+    r"(^|/)permission[^/]*\.(py|js|ts)$",
+    # Database / schema
+    r"(^|/)migrations?(/|$)",
+    r"(^|/)migration[^/]*(\.py|\.sql)?$",
+    r"(^|/)schema[^/]*(\.py|\.sql|\.json)?$",
+    r"(^|/)models?(/|\.py$|\.js$|\.ts$)",
+    # Application entry points
+    r"(^|/)(main|app|server|index)\.(py|js|ts)$",
+    # Config files
     r"\.(yml|yaml)$",
 ]
 
@@ -323,11 +349,19 @@ def load_config(repo_path: str) -> PayloadGuardConfig:
     config_path = Path(repo_path) / "payloadguard.yml"
     if not config_path.exists():
         return PayloadGuardConfig()
-    with open(config_path) as f:
-        user_cfg = yaml.safe_load(f) or {}
+    try:
+        with open(config_path) as f:
+            user_cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return PayloadGuardConfig()
     merged = _deep_merge(DEFAULT_CONFIG, user_cfg)
+    merged_thresholds = merged.get("thresholds", copy.deepcopy(DEFAULT_CONFIG["thresholds"]))
+    for _key in ("branch_age_days", "files_deleted", "lines_deleted"):
+        _val = merged_thresholds.get(_key)
+        if isinstance(_val, list) and len(_val) == 3:
+            merged_thresholds[_key] = sorted(_val)
     return PayloadGuardConfig(
-        thresholds=merged.get("thresholds", copy.deepcopy(DEFAULT_CONFIG["thresholds"])),
+        thresholds=merged_thresholds,
         semantic=merged.get("semantic",   copy.deepcopy(DEFAULT_CONFIG["semantic"])),
     )
 
@@ -415,22 +449,24 @@ class PayloadAnalyzer:
             files_copied   = len([d for d in diffs if d.change_type == 'C'])
             files_typed    = len([d for d in diffs if d.change_type == 'T'])
 
+            # Use git's own numstat for line counts: handles binary files correctly
+            # ('-' entries) and avoids loading blobs into memory.
             lines_added = 0
             lines_deleted = 0
-
-            for d in diffs:
-                if d.change_type == 'A':
-                    try:
-                        content = d.b_blob.data_stream.read().decode('utf-8', errors='ignore')
-                        lines_added += len(content.split('\n'))
-                    except Exception:
-                        pass
-                elif d.change_type == 'D':
-                    try:
-                        content = d.a_blob.data_stream.read().decode('utf-8', errors='ignore')
-                        lines_deleted += len(content.split('\n'))
-                    except Exception:
-                        pass
+            try:
+                numstat = self.repo.git.diff(
+                    '--numstat', merge_base[0].hexsha, branch_ref
+                )
+                for line in numstat.splitlines():
+                    parts = line.split('\t')
+                    if len(parts) == 3:
+                        added_str, deleted_str = parts[0], parts[1]
+                        if added_str != '-':
+                            lines_added += int(added_str)
+                        if deleted_str != '-':
+                            lines_deleted += int(deleted_str)
+            except Exception:
+                pass
 
             # LAYER 4: STRUCTURAL DRIFT
             structural_th = self.config.thresholds["structural"]
@@ -472,10 +508,18 @@ class PayloadAnalyzer:
             target_commit = self.repo.commit(target_ref)
             branch_date = branch_commit.committed_datetime
             target_date = target_commit.committed_datetime
-            days_old = (target_date - branch_date).days
+            # Clamp to zero: branch newer than target is treated as age 0, not an error.
+            days_old = max(0, (target_date - branch_date).days)
 
             total_lines_changed = lines_added + lines_deleted
             deletion_ratio = (lines_deleted / total_lines_changed * 100) if total_lines_changed > 0 else 0
+
+            # LAYER 2: FORENSIC — critical path detection via regex
+            deleted_files = [d.a_path for d in diffs if d.change_type == 'D']
+            critical_deletions = [
+                f for f in deleted_files
+                if any(re.search(p, f) for p in CRITICAL_PATH_PATTERNS)
+            ]
 
             # LAYER 3: CONSEQUENCE VERDICT
             verdict = self._assess_consequence(
@@ -484,14 +528,8 @@ class PayloadAnalyzer:
                 days_old,
                 deletion_ratio,
                 overall_structural_severity,
+                critical_file_deletions=len(critical_deletions),
             )
-
-            # LAYER 2: FORENSIC — critical path detection via regex
-            deleted_files = [d.a_path for d in diffs if d.change_type == 'D']
-            critical_deletions = [
-                f for f in deleted_files
-                if any(re.search(p, f) for p in CRITICAL_PATH_PATTERNS)
-            ]
 
             # LAYER 5a: TEMPORAL DRIFT
             temporal_th = self.config.thresholds["temporal"]
@@ -561,7 +599,7 @@ class PayloadAnalyzer:
                 "error_type": type(e).__name__,
             }
 
-    def _assess_consequence(self, files_deleted, lines_deleted, days_old, deletion_ratio, structural_severity="LOW"):
+    def _assess_consequence(self, files_deleted, lines_deleted, days_old, deletion_ratio, structural_severity="LOW", critical_file_deletions=0):
         flags = []
         severity_score = 0.0
         th = self.config.thresholds
@@ -580,38 +618,54 @@ class PayloadAnalyzer:
             flags.append(f"Branch is {days_old} days old (3+ months)")
             severity_score += 1
 
+        # Three deletion dimensions are highly correlated — score independently
+        # then cap to prevent double-counting: max of the three + 1 bonus if ≥2 fire.
+        files_score = 0
         if files_deleted > files_th[2]:
             flags.append(f"{files_deleted} files would be deleted (massive scope)")
-            severity_score += 3
+            files_score = 3
         elif files_deleted > files_th[1]:
             flags.append(f"{files_deleted} files would be deleted (large scope)")
-            severity_score += 2
+            files_score = 2
         elif files_deleted > files_th[0]:
             flags.append(f"{files_deleted} files would be deleted")
-            severity_score += 1
+            files_score = 1
 
+        ratio_score = 0
         if deletion_ratio > 90:
             flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (almost entire changeset is deletions)")
-            severity_score += 3
+            ratio_score = 3
         elif deletion_ratio > 70:
             flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (majority of changes are deletions)")
-            severity_score += 2
+            ratio_score = 2
         elif deletion_ratio > 50:
             flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (more deletions than additions)")
-            severity_score += 1
+            ratio_score = 1
+
+        lines_score = 0
+        if lines_deleted > lines_th[2]:
+            flags.append(f"{lines_deleted:,} lines would be deleted (massive codebase change)")
+            lines_score = 3
+        elif lines_deleted > lines_th[1]:
+            flags.append(f"{lines_deleted:,} lines would be deleted (large codebase change)")
+            lines_score = 2
+        elif lines_deleted > lines_th[0]:
+            flags.append(f"{lines_deleted:,} lines would be deleted")
+            lines_score = 1
+
+        nonzero_dims = sum(1 for s in (files_score, ratio_score, lines_score) if s > 0)
+        deletion_dim = min(4, max(files_score, ratio_score, lines_score) + (1 if nonzero_dims >= 2 else 0))
+        severity_score += deletion_dim
 
         if structural_severity == "CRITICAL":
             flags.append("Structural drift CRITICAL — significant class/function deletions detected")
             severity_score += 3
 
-        if lines_deleted > lines_th[2]:
-            flags.append(f"{lines_deleted:,} lines would be deleted (massive codebase change)")
-            severity_score += 3
-        elif lines_deleted > lines_th[1]:
-            flags.append(f"{lines_deleted:,} lines would be deleted (large codebase change)")
+        if critical_file_deletions > 5:
+            flags.append(f"{critical_file_deletions} critical-path files deleted")
             severity_score += 2
-        elif lines_deleted > lines_th[0]:
-            flags.append(f"{lines_deleted:,} lines would be deleted")
+        elif critical_file_deletions > 0:
+            flags.append(f"{critical_file_deletions} critical-path file(s) deleted")
             severity_score += 1
 
         if severity_score >= 5:
@@ -745,6 +799,10 @@ def print_report(report):
     print("\n" + "="*70 + "\n")
 
 
+def _md_escape(name: str) -> str:
+    return name.replace('\\', '\\\\').replace('`', '\\`').replace('|', '\\|')
+
+
 def format_markdown_report(report: dict) -> str:
     """Generate GitHub-flavoured markdown from a PayloadGuard report."""
     if "error" in report:
@@ -826,12 +884,12 @@ def format_markdown_report(report: dict) -> str:
             for ff in s['flagged_files']:
                 m = ff['metrics']
                 out.append(
-                    f"| `{ff['file']}` | {m['deleted_node_count']} |"
+                    f"| `{_md_escape(ff['file'])}` | {m['deleted_node_count']} |"
                     f" {m['structural_deletion_ratio']}% | {ff['severity']} |"
                 )
             for ff in s['flagged_files']:
                 if ff['severity'] == 'CRITICAL' and ff['deleted_components']:
-                    out.append(f"\n**Deleted from `{ff['file']}`:**")
+                    out.append(f"\n**Deleted from `{_md_escape(ff['file'])}`:**")
                     for comp in ff['deleted_components'][:10]:
                         out.append(f"- `{comp}`")
         out.append("")
@@ -870,14 +928,14 @@ def format_markdown_report(report: dict) -> str:
         if deleted['critical']:
             out.append("**Critical deletions:**")
             for f in deleted['critical']:
-                out.append(f"- `{f}`")
+                out.append(f"- `{_md_escape(f)}`")
             out.append("")
         other = [f for f in deleted['all'] if f not in deleted['critical']]
         if other:
             out.append("<details><summary>Other deletions</summary>")
             out.append("")
             for f in other[:20]:
-                out.append(f"- `{f}`")
+                out.append(f"- `{_md_escape(f)}`")
             if deleted['total'] > 30:
                 out.append(f"\n_...and {deleted['total'] - 30} more_")
             out.append("")

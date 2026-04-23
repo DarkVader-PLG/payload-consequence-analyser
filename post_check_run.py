@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Post a GitHub Check Run using GitHub App credentials."""
 import os
+import stat
 import sys
 import time
 
 import jwt
 import requests
+from requests.adapters import HTTPAdapter, Retry
+
+
+def _require_env(name: str) -> str:
+    val = os.environ.get(name, "").strip()
+    if not val:
+        raise EnvironmentError(f"Required environment variable {name!r} is not set")
+    return val
 
 
 def main():
@@ -13,12 +22,17 @@ def main():
     if not app_id:
         print("No App credentials configured — skipping Check Run")
         return
-    app_id = app_id  # reassign for clarity below
-    private_key = os.environ["PAYLOADGUARD_PRIVATE_KEY"]
-    installation_id = os.environ["PAYLOADGUARD_INSTALLATION_ID"]
-    head_sha = os.environ["PR_HEAD_SHA"]
-    repo = os.environ["GITHUB_REPOSITORY"]
-    exit_code = int(os.environ.get("PAYLOADGUARD_EXIT_CODE", "1"))
+
+    private_key     = _require_env("PAYLOADGUARD_PRIVATE_KEY")
+    installation_id = _require_env("PAYLOADGUARD_INSTALLATION_ID")
+    head_sha        = _require_env("PR_HEAD_SHA")
+    repo            = _require_env("GITHUB_REPOSITORY")
+
+    try:
+        exit_code = int(os.environ.get("PAYLOADGUARD_EXIT_CODE", "1"))
+    except ValueError:
+        exit_code = 1
+
     report_path = os.environ.get("PAYLOADGUARD_REPORT_PATH", "")
 
     now = int(time.time())
@@ -28,7 +42,11 @@ def main():
         algorithm="RS256",
     )
 
-    resp = requests.post(
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+
+    resp = session.post(
         f"https://api.github.com/app/installations/{installation_id}/access_tokens",
         headers={
             "Authorization": f"Bearer {app_token}",
@@ -50,11 +68,16 @@ def main():
         title = "PayloadGuard — analysis error"
 
     summary = title
-    if report_path and os.path.exists(report_path):
-        with open(report_path, encoding="utf-8") as f:
-            summary = f.read()[:65535]
+    if report_path:
+        try:
+            st = os.stat(report_path)
+            if stat.S_ISREG(st.st_mode):
+                with open(report_path, encoding="utf-8") as f:
+                    summary = f.read()[:65535]
+        except OSError:
+            pass
 
-    resp = requests.post(
+    resp = session.post(
         f"https://api.github.com/repos/{repo}/check-runs",
         headers={
             "Authorization": f"Bearer {install_token}",
