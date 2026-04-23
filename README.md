@@ -1,18 +1,17 @@
 # PayloadGuard
 
-**PayloadGuard** is a 5-layer branch analysis tool that scans a PR before it merges and produces a forensic verdict on the risk of the changeset.
+**PayloadGuard** is a 5-layer branch analysis tool that scans a pull request before it merges and produces a forensic verdict on the risk of the changeset. It was built to stop the class of attack where a destructive diff is hidden behind a harmless-sounding description — and to catch it before a human reviewer has to.
 
-It checks:
+Each scan produces a verdict: **SAFE**, **REVIEW**, **CAUTION**, or **DESTRUCTIVE**. In CI it posts a GitHub Check Run with a full contextual report. Wire the exit code to a branch protection rule and DESTRUCTIVE verdicts block the merge button automatically.
 
-| Layer | What it does |
+| Layer | What it checks |
 |---|---|
-| Surface | Files and lines changed, deletion ratios |
-| Forensic | Weighted risk scoring across all signals |
-| Structural | AST diff — which classes and functions actually disappeared (Python, JS, TS, Go, Rust, Java) |
-| Temporal | Branch age × repo velocity — how stale is the context |
-| Semantic | Does the PR description match what the diff actually does |
-
-Each scan produces a verdict: **SAFE**, **REVIEW**, **CAUTION**, or **DESTRUCTIVE**. In CI it posts a sticky PR comment and a GitHub Check Run. Wire the exit code to a branch protection rule and DESTRUCTIVE verdicts block the merge button automatically.
+| 1 — Surface Scan | Files and lines changed, deletion ratios, binary file handling |
+| 2 — Forensic Analysis | Critical-path file detection, deletion ratios, file permission changes, symlink/submodule detection |
+| 3 — Consequence Model | Weighted scoring across all signals → final verdict |
+| 4 — Structural Drift | AST diff — which named classes, functions, and constants actually disappeared |
+| 5a — Temporal Drift | Branch age × repo velocity — how stale is the context |
+| 5b — Semantic Transparency | Does the PR description match what the diff actually does |
 
 > **dev:** [Dark^Vader](https://github.com/DarkVader-PLG)
 
@@ -80,13 +79,15 @@ Every scan produces the same structured report. Here's what each section tells y
 
 ### 📅 Temporal
 
-How old the branch is relative to the target, and which commits are being compared. A branch that's been sitting open for months while the target keeps moving is already a problem before you look at a single line.
+Branch age and the commits being compared. A long-lived branch may have diverged significantly from what the target codebase now looks like.
 
 ```
 📅 TEMPORAL
    Branch age: 14 days
    Branch: a1b2c3d (2026-04-08)
    Target:  e4f5g6h (2026-04-22)
+
+Branch is 14 days old — context is fresh.
 ```
 
 ---
@@ -101,39 +102,43 @@ Raw scope of the changeset — files added, deleted, modified. Deletions are the
    Deleted:    1
    Modified:   5
    Total:      9
+
+1 file(s) deleted — within normal range (flag threshold: >10).
 ```
 
 ---
 
 ### 📝 Line changes
 
-Volume and direction of change. Deletion ratio is the derived signal — what fraction of total churn is removal. Above 50% starts raising flags; above 90% means almost everything this PR touches is being taken away.
+Volume and direction of change. Deletion ratio measures what fraction of total churn is removal. Above 50% starts raising flags; above 90% means almost everything this PR touches is being taken away.
+
+> **Note:** The deletion ratio gate only fires when at least 100 lines are deleted. A 5-deleted/15-added PR won't be flagged on ratio alone — absolute scale matters.
 
 ```
 📝 LINE CHANGES
    Added:        420 lines
    Deleted:       18 lines
-   Net:          402 lines
+   Net:          +402 lines
    Deletion ratio: 4.1%
+
+4.1% of total churn is deletion — within normal range (flag threshold: >50%).
 ```
 
 ---
 
 ### 🧬 Structural drift — Layer 4
 
-Parses every modified source file and computes exactly which named classes and functions disappeared. This is the layer that catches a file being "modified" when it's actually been gutted — line diffs alone won't tell you that `AuthManager` and `SessionStore` no longer exist.
+Parses every modified source file and computes exactly which named classes, functions, and constants disappeared. This is the layer that catches a file being "modified" when it's actually been gutted — line diffs alone won't tell you that `AuthManager` and `SessionStore` no longer exist.
 
 Flags `CRITICAL` only when both conditions are met: deletion ratio exceeds the threshold **and** enough nodes were deleted. The dual gate prevents noise from small utility files.
 
-**Supported languages:** Python · JavaScript · TypeScript · Go · Rust · Java (`.py .js .jsx .ts .tsx .go .rs .java`). Python uses stdlib AST. All others use tree-sitter — files for grammars not installed are skipped silently.
+**Supported languages:** Python · JavaScript · TypeScript · Go · Rust · Java (`.py .js .jsx .ts .tsx .go .rs .java`). Python uses stdlib AST. All others use tree-sitter. Files for grammars not installed are skipped silently.
 
-```
-🧬 STRUCTURAL DRIFT (Layer 4)
-   Overall severity: LOW
-   Max deletion ratio: 0.0%
-```
+**Python tracking includes:** named functions, classes, async functions, module-level assignments (`MAX_RETRIES = 5`), and annotated assignments (`SECRET_KEY: str = "..."`).
 
-If something is actually being removed at scale:
+**Rust tracking includes:** functions, structs, enums, traits, `const` items, `static` items.
+
+**Go tracking includes:** functions, methods, type specs, `const` specs.
 
 ```
 🧬 STRUCTURAL DRIFT (Layer 4)
@@ -142,13 +147,16 @@ If something is actually being removed at scale:
       - AuthManager
       - SessionStore
       - TokenValidator
+      - SECRET_KEY
+
+No significant class, function, or constant deletions detected — file content is structurally intact.
 ```
 
 ---
 
 ### ⏱ Temporal drift — Layer 5a
 
-Compound score: `branch_age_days × target_commits_per_day`. Raw age alone is a weak signal — a 90-day branch on a slow repo is nothing; on a fast repo it's a serious semantic gap. The drift score accounts for both.
+Compound score: `branch_age_days × target_commits_per_day`. Raw age alone is a weak signal — a 90-day branch on a slow repo is nothing; on a fast repo it's a serious semantic gap.
 
 | Status | Drift Score | Meaning |
 |---|---|---|
@@ -159,7 +167,7 @@ Compound score: `branch_age_days × target_commits_per_day`. Raw age alone is a 
 ```
 ⏱  TEMPORAL DRIFT (Layer 5a)
    Status: CURRENT [LOW]
-   Drift Score: 14.0
+   Drift Score: 14.0  (CURRENT <250 · STALE 250–1,000 · DANGEROUS ≥1,000)
    Target velocity: 1.0 commits/day
    ✓ SAFE. Branch context is synchronized with target.
 ```
@@ -176,17 +184,23 @@ Compares the PR description against the verified severity. If the description us
 | `UNVERIFIED` | No description provided |
 | `DECEPTIVE_PAYLOAD` | Description claims low impact, diff says otherwise |
 
-```
-🔎 SEMANTIC TRANSPARENCY (Layer 5b)
-   Status: TRANSPARENT
-   ✓ SAFE. PR description aligns with verified structural impact.
-```
+---
+
+### ⚠️ Commit message flags
+
+Scans up to 50 commits between the merge base and branch tip for red-flag language: removing all tests, disabling auth, bypassing security checks, dropping a database. Surfaced as advisory — doesn't change the score, but appears prominently in the report.
+
+---
+
+### 🔐 Permission changes
+
+Detects files whose mode changed — specifically files that were made executable without any content change. A script silently gaining execute permission is a supply-chain signal.
 
 ---
 
 ### 🔍 Verdict
 
-The final call. Produced by the consequence model (Layer 3) which accumulates a weighted score across all signals. No single threshold triggers it — it's the combination that matters.
+The final call. Produced by the consequence model (Layer 3) which accumulates a weighted score across all signals.
 
 | Verdict | Severity | Score | Meaning |
 |---|---|---|---|
@@ -242,7 +256,7 @@ jobs:
 
       - name: PayloadGuard
         id: payloadguard
-        uses: DarkVader-PLG/payload-consequence-analyser@v1
+        uses: DarkVader-PLG/payload-consequence-analyser@main
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           pr-description: ${{ github.event.pull_request.body }}
@@ -260,7 +274,7 @@ With [GitHub App](#github-app) secrets wired up, pass them too:
 
 ```yaml
       - name: PayloadGuard
-        uses: DarkVader-PLG/payload-consequence-analyser@v1
+        uses: DarkVader-PLG/payload-consequence-analyser@main
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           pr-description: ${{ github.event.pull_request.body }}
@@ -280,12 +294,12 @@ For a named **PayloadGuard** check badge in the PR checks tab (beyond the sticky
 | Secret | Value |
 |---|---|
 | `PAYLOADGUARD_APP_ID` | Your App ID |
-| `PAYLOADGUARD_PRIVATE_KEY` | Contents of the generated `.pem` private key |
+| `PAYLOADGUARD_PRIVATE_KEY` | Contents of the generated `.pem` private key (RSA PEM format) |
 | `PAYLOADGUARD_INSTALLATION_ID` | Installation ID from `github.com/settings/installations` |
 
-With those set, the workflow calls `post_check_run.py` to post a Check Run after each scan — green for SAFE, red for DESTRUCTIVE, with the full report as the body.
+With those set, the workflow calls `post_check_run.py` to post a Check Run after each scan — green for SAFE, red for DESTRUCTIVE, with the full contextual report as the body.
 
-Without the secrets the step is a no-op; the sticky comment and merge blocking still work.
+Without the secrets the step is a no-op; the merge blocking still works.
 
 ---
 
@@ -296,7 +310,7 @@ Drop a `payloadguard.yml` in your repo root. Everything is optional — omit wha
 ```yaml
 # payloadguard.yml
 thresholds:
-  branch_age_days: [90, 180, 365]      # score goes up at each
+  branch_age_days: [90, 180, 365]      # score goes up at each tier
   files_deleted:   [10, 20, 50]
   lines_deleted:   [5000, 10000, 50000]
   temporal:
@@ -316,7 +330,7 @@ semantic:
     - small tweak
 ```
 
-Tighten it for anything that matters:
+Threshold lists must be in ascending order — out-of-order values are auto-sorted. Tighten for anything that matters:
 
 ```yaml
 thresholds:
@@ -335,30 +349,62 @@ semantic:
 
 ## How it works
 
-Five layers. Every scan, every time.
-
-| Layer | What it checks |
-|---|---|
-| 1 — Surface Scan | Files and lines changed |
-| 2 — Forensic Analysis | Deletion ratio, critical path detection |
-| 3 — Consequence Model | Weighted score → final verdict |
-| 4 — Structural Drift | AST/tree-sitter diff — which classes and functions actually disappeared (Python, JS, TS, Go, Rust, Java) |
-| 5a — Temporal Drift | Branch age × repo velocity |
-| 5b — Semantic Transparency | Does the PR description match what the diff actually does |
+Five layers, every scan, every time.
 
 ### Scoring (Layer 3)
 
 Points accumulate across signals. No single threshold kills you — it's the pile-up that matters.
 
+**Branch age**
+
+| Days old | Points |
+|---|---|
+| > 90 | +1 |
+| > 180 | +2 |
+| > 365 | +3 |
+
+**Deletion dimensions (files deleted, deletion ratio, lines deleted)**
+
+These three signals are highly correlated — a large destructive PR will naturally score on all three. To prevent double-counting, they are scored independently and then capped:
+
+```
+deletion_score = min(4, max(files_score, ratio_score, lines_score) + bonus)
+bonus = 1 if at least 2 dimensions are non-zero, else 0
+```
+
+Individual dimension thresholds:
+
 | Signal | Thresholds | Points |
 |---|---|---|
-| Branch age | > 90 / 180 / 365 days | 1 / 2 / 3 |
-| Files deleted | > 10 / 20 / 50 | 1 / 2 / 3 |
-| Deletion ratio | > 50% / 70% / 90% | 1 / 2 / 3 |
-| Structural severity | CRITICAL | 3 |
-| Lines deleted | > 5k / 10k / 50k | 1 / 2 / 3 |
+| Files deleted | > 10 / > 20 / > 50 | 1 / 2 / 3 |
+| Deletion ratio | > 50% / > 70% / > 90% | 1 / 2 / 3 |
+| Lines deleted | > 5k / > 10k / > 50k | 1 / 2 / 3 |
 
-`≥ 5` → DESTRUCTIVE. `3–4` → CAUTION. `1–2` → REVIEW. `0` → SAFE.
+> Deletion ratio only fires when at least 100 lines are deleted.
+
+**Critical path weighting**
+
+Files matching high-value path patterns (tests, CI workflows, auth, schema, migrations, entry points) carry extra weight:
+
+| Critical files deleted | Points |
+|---|---|
+| > 5 | +2 |
+| > 0 | +1 |
+
+**Structural severity**
+
+| Condition | Points |
+|---|---|
+| Layer 4 severity = CRITICAL | +3 |
+
+**Verdict thresholds**
+
+| Score | Verdict |
+|---|---|
+| 0 | SAFE |
+| 1–2 | REVIEW |
+| 3–4 | CAUTION |
+| ≥ 5 | DESTRUCTIVE |
 
 ---
 
@@ -384,11 +430,15 @@ PAYLOADGUARD ANALYSIS: codex-suggestion → main
    Modified:   4
    Total:     67
 
+   61 files deleted — massive scope (flag threshold: >10 REVIEW · >20 CAUTION · >50 DESTRUCTIVE).
+
 📝 LINE CHANGES
    Added:        214 lines
    Deleted:   11,967 lines
    Net:       -11,753 lines
    Deletion ratio: 98.2%
+
+   98.2% deletion ratio — almost the entire changeset is deletions (threshold: >90% → DESTRUCTIVE).
 
 🧬 STRUCTURAL DRIFT (Layer 4)
    Overall severity: CRITICAL
@@ -400,12 +450,13 @@ PAYLOADGUARD ANALYSIS: codex-suggestion → main
       - PermissionGate
       - RoleRegistry
 
+   Named structural components have been deleted at scale.
+
 ⏱  TEMPORAL DRIFT (Layer 5a)
    Status: DANGEROUS [CRITICAL]
-   Drift Score: 3120.0
+   Drift Score: 3120.0  (CURRENT <250 · STALE 250–1,000 · DANGEROUS ≥1,000)
    Target velocity: 10.0 commits/day
-   ❌ DO NOT MERGE. Extreme semantic drift detected. Mandatory rebase
-      and manual architectural review required.
+   ❌ DO NOT MERGE. Extreme semantic drift detected.
 
 🔎 SEMANTIC TRANSPARENCY (Layer 5b)
    Status: DECEPTIVE_PAYLOAD
@@ -419,26 +470,10 @@ PAYLOADGUARD ANALYSIS: codex-suggestion → main
    ⚠️  Deletion ratio: 98.2% (almost entire changeset is deletions)
    ⚠️  Structural drift CRITICAL — significant class/function deletions detected
    ⚠️  11,967 lines would be deleted (large codebase change)
+   ⚠️  5 critical-path files deleted
 
 ✉️  RECOMMENDATION:
    ❌ DO NOT MERGE — This would catastrophically alter the codebase
-
-🗑️  DELETED FILES (61 total)
-
-   CRITICAL DELETIONS:
-      - tests/test_auth.py
-      - tests/test_core.py
-      - tests/test_integration.py
-      - .github/workflows/ci.yml
-      - src/core/auth.py
-      - src/core/engine.py
-      - requirements.txt
-
-   OTHER DELETIONS:
-      - src/modules/session.py
-      - src/modules/permissions.py
-      - src/modules/roles.py
-      ... and 51 more files
 
 ======================================================================
 ```
