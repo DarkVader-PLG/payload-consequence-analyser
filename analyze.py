@@ -923,40 +923,103 @@ def format_markdown_report(report: dict) -> str:
     out.append("---")
     out.append("")
 
-    # Temporal
+    # ── Temporal ──────────────────────────────────────────────────────────────
+    age = temporal['branch_age_days']
+    if age == 0:
+        age_note = "Branch is current — created against this target, no staleness risk."
+    elif age < 30:
+        age_note = f"Branch is {age} days old — context is fresh."
+    elif age < 90:
+        age_note = f"Branch is {age} days old — approaching the review threshold (90 days)."
+    elif age < 180:
+        age_note = f"Branch is {age} days old — past the review threshold. Confirm context is still valid before merging."
+    elif age < 365:
+        age_note = f"Branch is {age} days old — significantly stale. Rebase strongly recommended."
+    else:
+        age_note = f"Branch is {age} days old — over a year. Mandatory rebase before merge."
+
     out.append("### 📅 Temporal")
+    out.append("_Branch age and the commits being compared. A long-lived branch may have diverged significantly from what the target codebase now looks like._")
+    out.append("")
     out.append("| | |")
     out.append("|---|---|")
-    out.append(f"| Branch age | {temporal['branch_age_days']} days |")
+    out.append(f"| Branch age | {age} days |")
     out.append(f"| Branch commit | `{temporal['branch_commit_hash']}` ({temporal['branch_last_commit'][:10]}) |")
     out.append(f"| Target commit | `{temporal['target_commit_hash']}` ({temporal['target_last_commit'][:10]}) |")
     out.append("")
+    out.append(f"_{age_note}_")
+    out.append("")
 
-    # File changes
+    # ── File Changes ──────────────────────────────────────────────────────────
+    n_deleted = files['deleted']
+    n_total   = files['total_changed']
+    if n_total == 0:
+        file_note = "No file changes detected in this diff."
+    elif n_deleted == 0:
+        file_note = f"{n_total} file(s) changed — no deletions."
+    elif n_deleted > 50:
+        file_note = f"**{n_deleted} files deleted** — massive scope (flag thresholds: >10 REVIEW · >20 CAUTION · >50 DESTRUCTIVE)."
+    elif n_deleted > 20:
+        file_note = f"**{n_deleted} files deleted** — large scope (flag thresholds: >10 REVIEW · >20 CAUTION · >50 DESTRUCTIVE)."
+    elif n_deleted > 10:
+        file_note = f"{n_deleted} files deleted — moderate removal (flag threshold: >10 REVIEW · >20 CAUTION · >50 DESTRUCTIVE)."
+    else:
+        file_note = f"{n_deleted} file(s) deleted — within normal range (flag threshold: >10)."
+
     out.append("### 📁 File Changes")
+    out.append("_Raw scope of the change — how many files are being added, removed, or touched. Deletions are the number to watch._")
+    out.append("")
     out.append("| Type | Count |")
     out.append("|---|---|")
     out.append(f"| Added | {files['added']} |")
-    out.append(f"| Deleted | {files['deleted']} |")
+    out.append(f"| Deleted | {n_deleted} |")
     out.append(f"| Modified | {files['modified']} |")
-    out.append(f"| Total | {files['total_changed']} |")
+    out.append(f"| Total | {n_total} |")
+    out.append("")
+    out.append(f"_{file_note}_")
     out.append("")
 
-    # Line changes
+    # ── Line Changes ──────────────────────────────────────────────────────────
+    ratio = lines['deletion_ratio_percent']
+    net   = lines['net_change']
+    if lines['deleted'] == 0:
+        ratio_note = "No lines deleted — no destructive churn detected."
+    elif ratio < 50:
+        ratio_note = f"{ratio}% of total churn is deletion — within normal range (flag threshold: >50%)."
+    elif ratio < 70:
+        ratio_note = f"**{ratio}% deletion ratio** — more than half of all churn is removal (threshold: >50% → REVIEW)."
+    elif ratio < 90:
+        ratio_note = f"**{ratio}% deletion ratio** — majority of changes are deletions (threshold: >70% → CAUTION)."
+    else:
+        ratio_note = f"**{ratio}% deletion ratio** — almost the entire changeset is deletions (threshold: >90% → DESTRUCTIVE)."
+
     out.append("### 📝 Line Changes")
+    out.append("_Volume and direction of change. Deletion ratio — the fraction of total churn that is removal — is the key derived signal. Above 50% starts raising flags; above 90% means almost everything this PR touches is being taken away._")
+    out.append("")
     out.append("| | |")
     out.append("|---|---|")
     out.append(f"| Added | {lines['added']:,} |")
     out.append(f"| Deleted | {lines['deleted']:,} |")
-    out.append(f"| Net | {lines['net_change']:,} |")
-    out.append(f"| Deletion ratio | {lines['deletion_ratio_percent']}% |")
+    out.append(f"| Net | {net:+,} |")
+    out.append(f"| Deletion ratio | {ratio}% |")
+    out.append("")
+    out.append(f"_{ratio_note}_")
     out.append("")
 
-    # Structural drift
+    # ── Structural Drift ──────────────────────────────────────────────────────
     if 'structural' in report:
         s = report['structural']
         sev_emoji = "🚨" if s['overall_severity'] == 'CRITICAL' else "✅"
+        if s['overall_severity'] == 'CRITICAL':
+            struct_note = "Named structural components have been deleted at scale — review the list below carefully before merging."
+        elif s['flagged_files']:
+            struct_note = "Some structural changes detected but below the critical threshold — worth a manual look."
+        else:
+            struct_note = "No significant class, function, or constant deletions detected — file content is structurally intact."
+
         out.append("### 🧬 Structural Drift (Layer 4)")
+        out.append("_Parses every modified source file and tracks exactly which named classes, functions, and constants disappeared. This catches a file being \"modified\" when it's actually been gutted — line diffs alone won't tell you that `AuthManager` no longer exists._")
+        out.append("")
         out.append(
             f"**Severity:** {sev_emoji} `{s['overall_severity']}`"
             f"  |  **Max deletion ratio:** {s['max_deletion_ratio_pct']}%"
@@ -976,39 +1039,47 @@ def format_markdown_report(report: dict) -> str:
                     out.append(f"\n**Deleted from `{_md_escape(ff['file'])}`:**")
                     for comp in ff['deleted_components'][:10]:
                         out.append(f"- `{comp}`")
+            out.append("")
+        out.append(f"_{struct_note}_")
         out.append("")
 
-    # Temporal drift
+    # ── Temporal Drift ────────────────────────────────────────────────────────
     if 'temporal_drift' in report:
         td = report['temporal_drift']
         m  = td['metrics']
         td_emoji = {"CRITICAL": "🚨", "WARNING": "⚠️"}.get(td['severity'], "✅")
         out.append("### ⏱ Temporal Drift (Layer 5a)")
+        out.append("_Compound staleness score: `branch_age_days × target_commits/day`. Raw age alone is a weak signal — a 90-day branch on a slow repo is nothing; on a fast-moving repo it represents a serious semantic gap between what the branch was written against and what main looks like today._")
+        out.append("")
         out.append(f"**Status:** {td_emoji} `{td['status']}`")
         out.append("")
         out.append("| | |")
         out.append("|---|---|")
-        out.append(f"| Drift Score | {m['calculated_drift_score']:.1f} |")
+        out.append(f"| Drift score | {m['calculated_drift_score']:.1f} _(CURRENT <250 · STALE 250–1,000 · DANGEROUS ≥1,000)_ |")
         out.append(f"| Target velocity | {m['target_velocity']} commits/day |")
         out.append("")
         out.append(f"> {td['recommendation']}")
         out.append("")
 
-    # Semantic transparency
+    # ── Semantic Transparency ─────────────────────────────────────────────────
     if 'semantic' in report:
         sem = report['semantic']
         sem_emoji = {"DECEPTIVE_PAYLOAD": "🚨", "UNVERIFIED": "⚠️"}.get(sem['status'], "✅")
         out.append("### 🔎 Semantic Transparency (Layer 5b)")
+        out.append("_Compares the PR description against the verified severity. If the description uses low-impact language but the diff says otherwise, that's a deceptive payload pattern — the pattern at the centre of the April 2026 incident._")
+        out.append("")
         out.append(f"**Status:** {sem_emoji} `{sem['status']}`")
         if sem.get('matched_keyword'):
             out.append(f"  \n**Matched keyword:** `{sem['matched_keyword']}`")
         out.append(f"\n> {sem['directive']}")
         out.append("")
 
-    # Commit message flags
+    # ── Commit Message Flags ──────────────────────────────────────────────────
     commit_flags = report.get('commit_flags', [])
     if commit_flags:
         out.append("### ⚠️ Commit Message Flags")
+        out.append("_Commit messages between the merge base and branch tip were checked for red-flag language (disable auth, remove all tests, bypass security, etc.)._")
+        out.append("")
         out.append(f"**{len(commit_flags)} commit(s) matched red-flag patterns:**")
         out.append("")
         out.append("| SHA | Message |")
@@ -1017,12 +1088,12 @@ def format_markdown_report(report: dict) -> str:
             out.append(f"| `{cf['sha']}` | {_md_escape(cf['message'])} |")
         out.append("")
 
-    # Deleted files
+    # ── Deleted Files ─────────────────────────────────────────────────────────
     if deleted['total'] > 0:
         out.append(f"### 🗑️ Deleted Files ({deleted['total']} total)")
         out.append("")
         if deleted['critical']:
-            out.append("**Critical deletions:**")
+            out.append("**Critical deletions** _(matched high-value path patterns — tests, CI, auth, schema, entry points):_")
             for f in deleted['critical']:
                 out.append(f"- `{_md_escape(f)}`")
             out.append("")
