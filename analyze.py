@@ -467,16 +467,26 @@ class PayloadAnalyzer:
             files_copied   = len([d for d in diffs if d.change_type == 'C'])
             files_typed    = len([d for d in diffs if d.change_type == 'T'])
 
-            # Permission change detection (§1.5): making a script executable without
-            # changing content is a meaningful signal and shows up as a mode change.
+            # Permission change detection (§1.5) and symlink/submodule detection (§1.3).
             permission_changes = []
+            special_files: list[dict] = []
+            _SYMLINK_MODE    = 0o120000
+            _SUBMODULE_MODE  = 0o160000
             for d in diffs:
                 try:
-                    a_mode = getattr(d, 'a_mode', None)
-                    b_mode = getattr(d, 'b_mode', None)
-                    if a_mode and b_mode and a_mode != b_mode:
+                    a_mode = getattr(d, 'a_mode', None) or 0
+                    b_mode = getattr(d, 'b_mode', None) or 0
+                    fpath  = d.b_path or d.a_path or ''
+                    # Symlinks and submodules — flag regardless of change type.
+                    effective_mode = b_mode or a_mode
+                    if effective_mode & _SUBMODULE_MODE == _SUBMODULE_MODE:
+                        special_files.append({"file": fpath, "type": "submodule", "change_type": d.change_type})
+                    elif effective_mode & _SYMLINK_MODE == _SYMLINK_MODE:
+                        special_files.append({"file": fpath, "type": "symlink", "change_type": d.change_type})
+                    # Mode changes on regular files.
+                    elif a_mode and b_mode and a_mode != b_mode:
                         permission_changes.append({
-                            "file": d.b_path or d.a_path or '',
+                            "file": fpath,
                             "from_mode": oct(a_mode),
                             "to_mode": oct(b_mode),
                             "made_executable": bool(b_mode & 0o111 and not (a_mode & 0o111)),
@@ -642,6 +652,7 @@ class PayloadAnalyzer:
                 "semantic": semantic,
                 "commit_flags": commit_flags,
                 "permission_changes": permission_changes,
+                "special_files": special_files,
                 "deleted_files": {
                     "total": len(deleted_files),
                     "critical": critical_deletions[:10],
