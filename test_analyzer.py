@@ -330,7 +330,8 @@ class TestAssessConsequenceReview(unittest.TestCase):
         self.assertEqual(v["status"], "REVIEW")
 
     def test_deletion_ratio_over_50(self):
-        v = self.a._assess_consequence(0, 0, 0, 55)
+        # Ratio gate requires >= 100 lines deleted to fire
+        v = self.a._assess_consequence(0, 200, 0, 55)
         self.assertEqual(v["status"], "REVIEW")
 
     def test_5001_lines_deleted(self):
@@ -352,7 +353,8 @@ class TestAssessConsequenceCaution(unittest.TestCase):
         self.assertEqual(v["status"], "CAUTION")
 
     def test_deletion_ratio_over_70_plus_minor_flag(self):
-        v = self.a._assess_consequence(11, 0, 0, 75)
+        # Ratio gate requires >= 100 lines deleted; combine with file flag for CAUTION
+        v = self.a._assess_consequence(11, 200, 0, 75)
         self.assertEqual(v["status"], "CAUTION")
 
     def test_over_10000_lines_plus_old_branch(self):
@@ -795,6 +797,47 @@ class TestSaveJsonReport(unittest.TestCase):
     def test_gracefully_handles_write_error(self):
         with patch("builtins.open", side_effect=PermissionError("denied")):
             save_json_report({"x": 1}, "/bad/path.json")
+
+
+# ==============================================================================
+# Module-level constants tracked in structural parser (§1.6)
+# ==============================================================================
+
+class TestStructuralParserConstants(unittest.TestCase):
+    def setUp(self):
+        from structural_parser import extract_named_nodes
+        self.extract = extract_named_nodes
+
+    def test_module_level_assignment_tracked(self):
+        src = "MAX_RETRIES = 5\nTIMEOUT = 30\n"
+        names = self.extract(src, "module.py")
+        self.assertIn("MAX_RETRIES", names)
+        self.assertIn("TIMEOUT", names)
+
+    def test_annotated_assignment_tracked(self):
+        src = "SECRET_KEY: str = 'abc'\n"
+        names = self.extract(src, "config.py")
+        self.assertIn("SECRET_KEY", names)
+
+    def test_functions_still_tracked(self):
+        src = "def foo(): pass\nclass Bar: pass\n"
+        names = self.extract(src, "mod.py")
+        self.assertIn("foo", names)
+        self.assertIn("Bar", names)
+
+    def test_local_variable_not_tracked(self):
+        src = "def foo():\n    x = 1\n    return x\n"
+        names = self.extract(src, "mod.py")
+        self.assertNotIn("x", names)
+        self.assertIn("foo", names)
+
+    def test_deletion_of_constant_detected_by_structural_analyzer(self):
+        original = "SECRET = 'key'\n\ndef process(): pass\n"
+        modified = "def process(): pass\n"
+        result = StructuralPayloadAnalyzer(
+            original, modified, file_path="config.py",
+        ).analyze_structural_drift()
+        self.assertIn("SECRET", result.get("deleted_components", []))
 
 
 # ==============================================================================

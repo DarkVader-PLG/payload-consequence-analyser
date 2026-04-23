@@ -404,7 +404,7 @@ class PayloadAnalyzer:
             target_commit = self.repo.commit(ref)
             since = target_commit.committed_datetime - timedelta(days=90)
             commits = list(
-                self.repo.iter_commits(ref, since=since.isoformat())
+                self.repo.iter_commits(ref, since=since.isoformat(), max_count=1000)
             )
             return round(len(commits) / 90.0, 3)
         except Exception:
@@ -549,7 +549,7 @@ class PayloadAnalyzer:
             ).analyze_transparency()
 
             return {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "analysis": {
                     "branch": self.branch,
                     "target": self.target,
@@ -631,16 +631,20 @@ class PayloadAnalyzer:
             flags.append(f"{files_deleted} files would be deleted")
             files_score = 1
 
+        # Ratio scoring only fires when absolute deletions reach a meaningful scale.
+        # A 5-deleted / 15-added PR (25% ratio) is not a destructive changeset.
+        _RATIO_MIN_LINES = 100
         ratio_score = 0
-        if deletion_ratio > 90:
-            flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (almost entire changeset is deletions)")
-            ratio_score = 3
-        elif deletion_ratio > 70:
-            flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (majority of changes are deletions)")
-            ratio_score = 2
-        elif deletion_ratio > 50:
-            flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (more deletions than additions)")
-            ratio_score = 1
+        if lines_deleted >= _RATIO_MIN_LINES:
+            if deletion_ratio > 90:
+                flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (almost entire changeset is deletions)")
+                ratio_score = 3
+            elif deletion_ratio > 70:
+                flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (majority of changes are deletions)")
+                ratio_score = 2
+            elif deletion_ratio > 50:
+                flags.append(f"Deletion ratio: {deletion_ratio:.1f}% (more deletions than additions)")
+                ratio_score = 1
 
         lines_score = 0
         if lines_deleted > lines_th[2]:
@@ -943,8 +947,9 @@ def format_markdown_report(report: dict) -> str:
             out.append("")
 
     out.append("---")
-    ts = report.get('timestamp', '')[:16].replace('T', ' ')
-    out.append(f"_PayloadGuard scan — {ts} UTC_")
+    raw_ts = report.get('timestamp', '')
+    ts = raw_ts[:19].replace('T', ' ') + (' UTC' if '+' not in raw_ts and 'Z' not in raw_ts else '')
+    out.append(f"_PayloadGuard scan — {ts}_")
 
     return "\n".join(out)
 

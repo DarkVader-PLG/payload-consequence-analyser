@@ -41,12 +41,15 @@ _LANG_RULES: dict[str, dict[str, str]] = {
         "function_declaration": "name",
         "method_declaration":   "name",
         "type_spec":            "name",
+        "const_spec":           "name",
     },
     "rust": {
         "function_item": "name",
         "struct_item":   "name",
         "enum_item":     "name",
         "trait_item":    "name",
+        "const_item":    "name",
+        "static_item":   "name",
     },
     "java": {
         "class_declaration":     "name",
@@ -140,11 +143,21 @@ def extract_named_nodes(source: str, path: str) -> set[str]:
             tree = ast.parse(source)
         except SyntaxError as e:
             raise ValueError(f"SyntaxError: {e}") from e
-        return {
+        names = {
             node.name
             for node in ast.walk(tree)
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        # Also track module-level named assignments (constants, singletons, etc.)
+        # These are significant deletions even though they're not defs.
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        return names
 
     try:
         return _extract_via_treesitter(source, lang_key)
