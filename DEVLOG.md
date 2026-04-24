@@ -4,6 +4,157 @@ Reverse-chronological. Most recent entry first.
 
 ---
 
+## 2026-04-24 — Regression Tooling, Detection Calibration, and Scoring Fixes
+
+Full-day session building a local regression harness, running the analyser against 18 adversarial test cases, identifying detection gaps through systematic analysis, and shipping five scoring fixes that raised the pass rate from ~4/18 to 17/18 at default thresholds.
+
+### Commits (newest first)
+
+- `2844ff6` — Sync simulate_verdict with current analyze.py scoring logic
+- `a7cb6b7` — Fix pass rate metric to reflect latest run per test case
+- `d36bf88` — Raise structural CRITICAL score +3→+5; add database file to critical patterns
+- `917876a` — Fix unit test to match updated critical file deletion score (+1→+2)
+- `5cc517f` — Improve detection: security files, distributed structural, rename diffs, config deletions
+- `190b0db` — Fix expected verdicts for T09 and A10 (test-harness)
+
+---
+
+### Regression tooling — `payloadguard-test-harness`
+
+Three tools added under `tools/`:
+
+**`ingest.py`** — Pulls completed GitHub Actions workflow runs, downloads the `payloadguard-results` artifact from each, and writes normalised rows into a local SQLite database (`tools/db/results.db`). Idempotent via `INSERT OR IGNORE` on `workflow_run_id`. Tables: `scan_runs` (one row per scan), `structural_flags` (per-file L4 data), `expected_verdicts` (seeded from `test_cases.json`).
+
+**`run_regression.py`** — Full regression cycle in one command. Reopens all 18 closed test PRs → polls GitHub Check Runs until every scan completes → closes all PRs → optionally chains to ingest. Polling filters stale check runs by comparing `started_at` against the reopen timestamp, so previous run conclusions don't satisfy the wait condition.
+
+**`dashboard.py`** — Plotly Dash app (three tabs: matrix, history, threshold simulator). The simulator tab re-scores stored raw JSON reports using adjustable sliders for all key thresholds, showing how the pass/fail map shifts before touching any code. Loads at `http://127.0.0.1:8050`.
+
+**`test_cases.json`** — 18 entries mapping branch names to test case metadata (id, category, expected verdict, expected exit code, description).
+
+---
+
+### Test case metadata corrections
+
+Two entries in `test_cases.json` had wrong expected verdicts:
+
+- **T09 (`semantic/no-description`)**: Was `expected_verdict: SAFE`. The branch actually deletes `database.py`. Corrected to `DESTRUCTIVE / exit_code 2`. The test validates that L5b `UNVERIFIED` status (no PR description) does not suppress a destructive overall verdict.
+- **A10 (`adversarial/unicode-payload`)**: Was `expected_verdict: DESTRUCTIVE`. This is a robustness test — a minimal +4/-1 change with hostile Unicode in comments. The expected outcome is no crash and no false positive. Corrected to `SAFE / exit_code 0`.
+
+---
+
+### First regression baseline
+
+After the tooling was wired up and the `payloadguard-report.json` artifact upload was confirmed working, the first full 18-case regression produced this baseline at default thresholds (DESTRUCTIVE ≥ 5):
+
+| Result | Count |
+|---|---|
+| Correctly DESTRUCTIVE | 1 (T04 only) |
+| Correctly SAFE | 4 (T01, T02, T12, A10) |
+| Missed DESTRUCTIVE (CAUTION/REVIEW) | 13 |
+
+Pass rate: ~28%. The scoring model was producing verdicts in the 2–4 range for most adversarial cases — real signals, but not reaching the DESTRUCTIVE threshold.
+
+---
+
+### Root cause analysis (round 1)
+
+Per-case investigation identified five structural gaps:
+
+**A02 — rename-smuggling (auth.py → identity.py, gutted contents)**
+L4 structural loop only processed `change_type == 'M'` (modifications). File renames (`change_type == 'R'`) were invisible to AST diffing even when the content was completely replaced.
+
+**A03 — slow-deletion (1 function removed from each of 5 files)**
+L4 uses `structural_score = max(per_file_ratio)`. Five files each losing one function sit below the per-file ratio threshold (e.g. 10% each). No cross-file aggregation existed.
+
+**A04 — addition-camouflage (300-line api.js addition + auth.py deletion)**
+Deletion of `auth.py` matched `CRITICAL_PATH_PATTERNS` but only scored +1. The large addition diluted the deletion ratio. Net score: 2 (REVIEW). A security-critical file being deleted outright should carry a much heavier signal.
+
+**A09 — config-only-deletion (settings.yml + requirements.txt deleted, 45 lines, 90%+ ratio)**
+The 100-line `_RATIO_MIN_LINES` floor prevented ratio scoring from firing. Absolute line volume was below threshold even though the deletion ratio was extreme and the deleted files were infrastructure-critical.
+
+**T09 — no-description (database.py deleted)**
+`database.py` matched no pattern in `CRITICAL_PATH_PATTERNS`. No bonus was applied. Score came entirely from line count/ratio, landing at CAUTION (3) — short of DESTRUCTIVE (5).
+
+---
+
+### Scoring fixes (`5cc517f`, `917876a`)
+
+**1. Security-critical file detection**
+Added `_SECURITY_CRITICAL_PATTERNS` constant covering `auth*`, `security*`, `permission*`, `authorization*` files (`.py/.js/.ts`). Any deleted file matching this set adds **+5** to the severity score — immediately DESTRUCTIVE. Fixes A04 and similar addition-camouflage attacks.
+
+**2. Rename diff coverage**
+L4 structural loop condition changed from `change_type == 'M'` to `change_type in ('M', 'R')`. Renamed files now go through full AST diffing using their original and new blobs. Fixes A02.
+
+**3. Cross-file structural aggregation**
+After the per-file structural loop, if ≥ 2 files have structural flags and their combined deleted node count reaches `min_deleted_nodes`, `overall_structural_severity` is set to CRITICAL. Fixes A03 distributed deletion evasion.
+
+**4. Ratio floor bypass**
+`_RATIO_MIN_LINES` is now `0` when `critical_file_deletions > 0` (was always 100). A 45-line config deletion at 90% ratio carries a real signal when the deleted files are CI/auth/schema files. Fixes A09.
+
+**5. Critical path file weight**
+`critical_file_deletions > 0` weight raised from **+1** to **+2** (was already +2 for > 5). Uniform +2 regardless of count.
+
+Result after these fixes: **12/18** passing.
+
+---
+
+### Root cause analysis (round 2)
+
+Remaining failures after round 1: T05, T09, T11, A03, A05, A06.
+
+For T05, T11, A03, A05: all had structural CRITICAL firing but scoring only +3, giving a total of 3 (CAUTION). Required +2 more to reach DESTRUCTIVE.
+
+For T09: `database.py` not in `CRITICAL_PATH_PATTERNS`, so no critical-path bonus and `_RATIO_MIN_LINES` floor not bypassed.
+
+For A06: every metric deliberately tuned just below its individual threshold. No single signal fires. No compound scoring exists. Known hard case.
+
+---
+
+### Scoring fixes (`d36bf88`)
+
+**Structural CRITICAL weight: +3 → +5**
+Per-case analysis confirmed that structural CRITICAL (≥ 20% AST node deletion AND ≥ 3 nodes) is a strong enough signal to warrant immediate DESTRUCTIVE on its own. Raising the weight from +3 to +5 fixes T05 (4 methods removed from auth.py), T11 (multilang structural deletions), A03 (cross-file aggregation triggers CRITICAL), and A05 (Auth class shell preserved, all methods deleted). Safe baseline tests (T01, T02, T12) confirmed unaffected.
+
+**`database[^/]*\.(py|js|ts)` added to `CRITICAL_PATH_PATTERNS`**
+Database layer file deletions now qualify as critical-path files, triggering the +2 weight and the `_RATIO_MIN_LINES = 0` bypass. Combined with the existing 90%+ ratio signal on T09's diff, this pushes the score to DESTRUCTIVE. Fixes T09.
+
+Result after these fixes: **17/18** passing. Only A06 (threshold-gaming) remains — a known limitation of purely individual-threshold scoring.
+
+---
+
+### Dashboard fixes
+
+**Pass rate metric** changed from all-time historical average (63% across all regression rounds including early sessions with old code) to latest run per test case (94% = 17/18). The summary card now reflects current detection capability.
+
+**`simulate_verdict`** rewritten to match the current `analyze.py` scoring exactly: structural +5, critical files +2 flat, `_RATIO_MIN_LINES` bypass, security file +5, cross-file aggregation. The simulator was previously diverging from actual CI results, making threshold exploration misleading.
+
+---
+
+### Final state
+
+| Test case | Category | Verdict | Pass |
+|---|---|---|---|
+| T01 safe/small-additive | safe | SAFE | ✅ |
+| T02 safe/docs-only | safe | SAFE | ✅ |
+| T12 safe/large-rename | safe | SAFE | ✅ |
+| T03 destructive/mass-deletion | destructive | DESTRUCTIVE | ✅ |
+| T04 destructive/april-2026-replica | destructive | DESTRUCTIVE | ✅ |
+| T05 boundary/structural-threshold | boundary | DESTRUCTIVE | ✅ |
+| T09 semantic/no-description | semantic | DESTRUCTIVE | ✅ |
+| T10 semantic/honest-critical | semantic | DESTRUCTIVE | ✅ |
+| T11 multilang/structural-js-ts-go | multilang | DESTRUCTIVE | ✅ |
+| A01 adversarial/keyword-evasion | adversarial | DESTRUCTIVE | ✅ |
+| A02 adversarial/rename-smuggling | adversarial | DESTRUCTIVE | ✅ |
+| A03 adversarial/slow-deletion | adversarial | DESTRUCTIVE | ✅ |
+| A04 adversarial/addition-camouflage | adversarial | DESTRUCTIVE | ✅ |
+| A05 adversarial/nested-gutting | adversarial | DESTRUCTIVE | ✅ |
+| A07 adversarial/new-file-replacement | adversarial | DESTRUCTIVE | ✅ |
+| A09 adversarial/config-only-deletion | adversarial | DESTRUCTIVE | ✅ |
+| A10 adversarial/unicode-payload | adversarial | SAFE | ✅ |
+| A06 adversarial/threshold-gaming | adversarial | SAFE | ❌ |
+
+---
+
 ## 2026-04-23 — Audit Hardening Session
 
 Full-day session working through the internal audit (`AUDIT.md`). The audit identified 42 findings across six categories. Today's session addressed 18+ of them across four commits, followed by report contextualisation and the PEM key validation fix.
