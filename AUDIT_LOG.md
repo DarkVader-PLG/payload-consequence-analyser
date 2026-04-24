@@ -238,6 +238,62 @@ These items remain open. They are documented here so the next audit run can asse
 
 ---
 
+## Findings Register — Audit Run: 2026-04-24
+
+Conducted by: Claude (claude-sonnet-4-6)
+Trigger: 18-case regression harness — baseline pass rate ~28% at default thresholds
+Fixes applied: 2026-04-24
+
+This run was driven by regression data, not a manual code audit. Root cause analysis on failing test cases exposed five previously uncatalogued detection gaps.
+
+### New Findings (regression-driven)
+
+| ID | Finding | Severity | Status | Commit |
+|---|---|---|---|---|
+| §R1 | L4 structural loop skipped `change_type == 'R'` (renames) — gutted renamed files not AST-diffed | HIGH | **Fixed** | `5cc517f` — condition changed to `in ('M', 'R')` |
+| §R2 | No cross-file structural aggregation — distributed deletions (1 node each from N files) escaped per-file threshold | HIGH | **Fixed** | `5cc517f` — post-loop aggregation: if ≥2 flagged files and sum(deleted_nodes) ≥ min_nodes → CRITICAL |
+| §R3 | Security-critical file deletions (`auth*`, `security*`, `permission*`, `authorization*`) had no dedicated score weight — deletion of `auth.py` masked by addition camouflage | HIGH | **Fixed** | `5cc517f` — `_SECURITY_CRITICAL_PATTERNS` + `security_file_deletions` parameter → +5 |
+| §R4 | `_RATIO_MIN_LINES = 100` floor suppressed ratio scoring on config-only deletions (e.g. 45-line settings.yml at 90% ratio) | MEDIUM | **Fixed** | `5cc517f` — floor drops to 0 when `critical_file_deletions > 0` |
+| §R5 | `database[^/]*\.(py\|js\|ts)` absent from `CRITICAL_PATH_PATTERNS` — database layer deletions scored no critical-path bonus | MEDIUM | **Fixed** | `d36bf88` — pattern added |
+
+### Scoring Model Updates
+
+| ID | Change | Commit |
+|---|---|---|
+| §3.2 (update) | Critical file deletion weight raised +1 → +2 flat (was tiered +1/+2; now always +2) | `5cc517f` |
+| §3.2 (update) | Structural CRITICAL weight raised +3 → +5 — per-case analysis confirmed single-file structural CRITICAL is sufficient for DESTRUCTIVE on its own | `d36bf88` |
+
+### Dashboard Tooling Fixes
+
+| Item | Status | Commit |
+|---|---|---|
+| Pass rate metric aggregated all historical runs (stale code rounds inflating/deflating %) | **Fixed** | `a7cb6b7` — query rewritten to latest run per test case |
+| `simulate_verdict` diverged from `analyze.py` (used old +3/+1/no security scoring) | **Fixed** | `2844ff6` — full rewrite to match current scoring logic |
+| Last Run summary card showed date only, no link to source | **Fixed** | `2a84a35` — full `HH:MM` timestamp, hyperlinked to GitHub Actions run |
+
+### Test Case Metadata Corrections
+
+| ID | Correction | Commit |
+|---|---|---|
+| T09 | `expected_verdict` corrected SAFE → DESTRUCTIVE (database.py deleted; L5b `UNVERIFIED` doesn't suppress a destructive verdict) | `190b0db` |
+| A10 | `expected_verdict` corrected DESTRUCTIVE → SAFE (robustness test — no real deletions, no false positive expected) | `190b0db` |
+
+---
+
+## Summary — 2026-04-24 Run
+
+| Category | New findings | Fixed | Carried open |
+|---|---|---|---|
+| Detection gaps (regression) | 5 | 5 | 0 |
+| Scoring model updates | 2 | 2 | 0 |
+| Dashboard tooling | 3 | 3 | 0 |
+| Test case metadata | 2 | 2 | 0 |
+| **Total** | **12** | **12** | **0** |
+
+**Pass rate after fixes: 17/18 (94%).** Only A06 (adversarial/threshold-gaming) remains undetected — every individual metric tuned just below its threshold. No compound detection exists for this pattern. Documented as a known limitation.
+
+---
+
 ## Next Audit Checklist
 
 Copy this section into the next audit issue or branch PR description.
