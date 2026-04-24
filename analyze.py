@@ -62,6 +62,7 @@ CRITICAL_PATH_PATTERNS = [
     r"(^|/)security[^/]*\.(py|js|ts)$",
     r"(^|/)permission[^/]*\.(py|js|ts)$",
     # Database / schema
+    r"(^|/)database[^/]*\.(py|js|ts)$",
     r"(^|/)migrations?(/|$)",
     r"(^|/)migration[^/]*(\.py|\.sql)?$",
     r"(^|/)schema[^/]*(\.py|\.sql|\.json)?$",
@@ -756,7 +757,7 @@ class PayloadAnalyzer:
 
         if structural_severity == "CRITICAL":
             flags.append("Structural drift CRITICAL — significant class/function deletions detected")
-            severity_score += 3
+            severity_score += 5
 
         if critical_file_deletions > 5:
             flags.append(f"{critical_file_deletions} critical-path files deleted")
