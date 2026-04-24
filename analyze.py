@@ -72,6 +72,15 @@ CRITICAL_PATH_PATTERNS = [
     r"\.(yml|yaml)$",
 ]
 
+# Security-critical file patterns — a subset of CRITICAL_PATH_PATTERNS that
+# warrant an immediate high-confidence DESTRUCTIVE signal when deleted.
+_SECURITY_CRITICAL_PATTERNS = [
+    r"(^|/)auth[^/]*\.(py|js|ts)$",
+    r"(^|/)security[^/]*\.(py|js|ts)$",
+    r"(^|/)permission[^/]*\.(py|js|ts)$",
+    r"(^|/)authorization[^/]*\.(py|js|ts)$",
+]
+
 # Commit message patterns that indicate deliberate destructive intent.
 # Conservative set — only phrases with low false-positive risk.
 _COMMIT_RED_FLAG_PATTERNS = [
@@ -520,7 +529,7 @@ class PayloadAnalyzer:
             overall_structural_severity = "LOW"
 
             for d in diffs:
-                if d.change_type != 'M':
+                if d.change_type not in ('M', 'R'):
                     continue
                 path = d.b_path or d.a_path or ''
                 if structural_parser.language_for_path(path) is None:
@@ -549,6 +558,16 @@ class PayloadAnalyzer:
                 except Exception:
                     pass
 
+            # Cross-file structural aggregation: distributed deletions across
+            # multiple files can collectively constitute a destructive payload
+            # even when no single file exceeds the per-file ratio threshold.
+            if overall_structural_severity != 'CRITICAL' and len(structural_flags) >= 2:
+                total_deleted_nodes = sum(
+                    f['metrics']['deleted_node_count'] for f in structural_flags
+                )
+                if total_deleted_nodes >= structural_th["min_deleted_nodes"]:
+                    overall_structural_severity = 'CRITICAL'
+
             branch_commit = self.repo.commit(branch_ref)
             target_commit = self.repo.commit(target_ref)
             branch_date = branch_commit.committed_datetime
@@ -565,6 +584,10 @@ class PayloadAnalyzer:
                 f for f in deleted_files
                 if any(re.search(p, f) for p in CRITICAL_PATH_PATTERNS)
             ]
+            security_deletions = [
+                f for f in deleted_files
+                if any(re.search(p, f) for p in _SECURITY_CRITICAL_PATTERNS)
+            ]
 
             # LAYER 3: CONSEQUENCE VERDICT
             verdict = self._assess_consequence(
@@ -574,6 +597,7 @@ class PayloadAnalyzer:
                 deletion_ratio,
                 overall_structural_severity,
                 critical_file_deletions=len(critical_deletions),
+                security_file_deletions=len(security_deletions),
             )
 
             # LAYER 5a: TEMPORAL DRIFT
@@ -666,7 +690,7 @@ class PayloadAnalyzer:
                 "error_type": type(e).__name__,
             }
 
-    def _assess_consequence(self, files_deleted, lines_deleted, days_old, deletion_ratio, structural_severity="LOW", critical_file_deletions=0):
+    def _assess_consequence(self, files_deleted, lines_deleted, days_old, deletion_ratio, structural_severity="LOW", critical_file_deletions=0, security_file_deletions=0):
         flags = []
         severity_score = 0.0
         th = self.config.thresholds
@@ -700,7 +724,9 @@ class PayloadAnalyzer:
 
         # Ratio scoring only fires when absolute deletions reach a meaningful scale.
         # A 5-deleted / 15-added PR (25% ratio) is not a destructive changeset.
-        _RATIO_MIN_LINES = 100
+        # When critical-path files are deleted the bar drops to zero — a 45-line
+        # config deletion at 90% ratio IS significant regardless of volume.
+        _RATIO_MIN_LINES = 0 if critical_file_deletions > 0 else 100
         ratio_score = 0
         if lines_deleted >= _RATIO_MIN_LINES:
             if deletion_ratio > 90:
@@ -737,7 +763,11 @@ class PayloadAnalyzer:
             severity_score += 2
         elif critical_file_deletions > 0:
             flags.append(f"{critical_file_deletions} critical-path file(s) deleted")
-            severity_score += 1
+            severity_score += 2
+
+        if security_file_deletions > 0:
+            flags.append(f"{security_file_deletions} security-critical file(s) deleted (auth/security/permission)")
+            severity_score += 5
 
         if severity_score >= 5:
             return {
