@@ -1,6 +1,6 @@
 name: PayloadGuard
 description: Scans a branch before merge and tells you exactly how badly it's going to hurt.
-author: DarkVader-PLG
+author: PayloadGuard-PLG
 
 branding:
   icon: shield
